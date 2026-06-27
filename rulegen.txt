@@ -1,0 +1,995 @@
+#!/usr/bin/env python3
+"""
+rulegen.py - Auto-Generate Rules from Your Codebase
+
+Usage:
+  python rulegen.py generate          # Index + generate .code-rules.json
+  python rulegen.py show              # Display current rules
+  python rulegen.py show-file <file>  # Show details for a specific file
+  python rulegen.py check <file>      # Check file against rules
+  python rulegen.py enforce           # Check all files against rules
+"""
+
+import ast
+import sys
+import json
+import hashlib
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple, Any
+from dataclasses import dataclass, field
+from collections import defaultdict
+import re
+
+# ============================================
+# DEFAULT SKIP PATTERNS
+# ============================================
+
+DEFAULT_SKIP_PATTERNS = [
+    '__pycache__', 'venv', '.venv', 'env', '.env',
+    'node_modules', '.git', '.github',
+    'site-packages', 'dist-packages',
+    '.mypy_cache', '.pytest_cache', '.ruff_cache',
+    'build', 'dist',
+    '*.pyc', '*.pyo',
+    '*.egg-info',
+    '.idea', '.vscode',
+    'tests', 'test',
+]
+
+# ============================================
+# DATA CLASSES
+# ============================================
+
+@dataclass
+class FileIndex:
+    """Index of a single file"""
+    path: str
+    exports: List[str]
+    imports: List[Dict[str, str]]
+    functions: List[Dict[str, Any]]
+    classes: List[Dict[str, Any]]
+    lines: int
+    hash: str
+
+@dataclass
+class ProjectIndex:
+    """Full project index"""
+    files: Dict[str, FileIndex] = field(default_factory=dict)
+    all_exports: Dict[str, List[str]] = field(default_factory=dict)
+    all_imports: Dict[str, List[Dict]] = field(default_factory=dict)
+    dependency_graph: Dict[str, List[str]] = field(default_factory=dict)
+    import_graph_reverse: Dict[str, List[str]] = field(default_factory=dict)
+    all_functions: List[Dict] = field(default_factory=list)
+    all_classes: List[Dict] = field(default_factory=list)
+    naming_conventions: Dict[str, Any] = field(default_factory=dict)
+    metrics: Dict[str, Any] = field(default_factory=dict)
+
+# ============================================
+# INDEXER
+# ============================================
+
+class PythonIndexer(ast.NodeVisitor):
+    """Indexes a single Python file"""
+    
+    def __init__(self, filepath: Path):
+        self.filepath = filepath
+        self.exports: List[str] = []
+        self.imports: List[Dict[str, str]] = []
+        self.functions: List[Dict[str, Any]] = []
+        self.classes: List[Dict[str, Any]] = []
+        self.lines = 0
+        self.docstrings: List[str] = []
+        self.names = set()
+        
+    def index(self, code: str) -> FileIndex:
+        """Parse and index the file"""
+        self.lines = len(code.splitlines())
+        
+        try:
+            tree = ast.parse(code, filename=str(self.filepath))
+            self.visit(tree)
+        except SyntaxError as e:
+            # Skip files with syntax errors
+            pass
+        
+        return FileIndex(
+            path=str(self.filepath),
+            exports=self.exports,
+            imports=self.imports,
+            functions=self.functions,
+            classes=self.classes,
+            lines=self.lines,
+            hash=hashlib.md5(code.encode()).hexdigest()
+        )
+    
+    def visit_Import(self, node: ast.Import):
+        """Index import statements"""
+        for alias in node.names:
+            self.imports.append({
+                'source': alias.name,
+                'alias': alias.asname or alias.name,
+                'type': 'import'
+            })
+        self.generic_visit(node)
+    
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        """Index from ... import statements"""
+        module = node.module or ''
+        for alias in node.names:
+            self.imports.append({
+                'source': f"{module}.{alias.name}" if module else alias.name,
+                'alias': alias.asname or alias.name,
+                'type': 'import_from',
+                'module': module
+            })
+        self.generic_visit(node)
+    
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        """Index function definitions"""
+        is_exported = not node.name.startswith('_')
+        
+        func_info = {
+            'name': node.name,
+            'line': node.lineno,
+            'params': len(node.args.args),
+            'is_async': False,
+            'is_exported': is_exported,
+            'docstring': ast.get_docstring(node) is not None,
+            'complexity': self._calculate_complexity(node),
+            'lines': node.end_lineno - node.lineno + 1 if hasattr(node, 'end_lineno') else 0,
+        }
+        self.functions.append(func_info)
+        
+        if is_exported:
+            self.exports.append(node.name)
+            self.names.add(node.name)
+        
+        self.generic_visit(node)
+    
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+        """Index async function definitions"""
+        is_exported = not node.name.startswith('_')
+        
+        func_info = {
+            'name': node.name,
+            'line': node.lineno,
+            'params': len(node.args.args),
+            'is_async': True,
+            'is_exported': is_exported,
+            'docstring': ast.get_docstring(node) is not None,
+            'complexity': self._calculate_complexity(node),
+            'lines': node.end_lineno - node.lineno + 1 if hasattr(node, 'end_lineno') else 0,
+        }
+        self.functions.append(func_info)
+        
+        if is_exported:
+            self.exports.append(node.name)
+            self.names.add(node.name)
+        
+        self.generic_visit(node)
+    
+    def visit_ClassDef(self, node: ast.ClassDef):
+        """Index class definitions"""
+        is_exported = not node.name.startswith('_')
+        
+        class_info = {
+            'name': node.name,
+            'line': node.lineno,
+            'is_exported': is_exported,
+            'docstring': ast.get_docstring(node) is not None,
+            'lines': node.end_lineno - node.lineno + 1 if hasattr(node, 'end_lineno') else 0,
+            'methods': []
+        }
+        
+        # Index methods
+        for child in node.body:
+            if isinstance(child, ast.FunctionDef):
+                class_info['methods'].append(child.name)
+            elif isinstance(child, ast.AsyncFunctionDef):
+                class_info['methods'].append(child.name)
+        
+        self.classes.append(class_info)
+        
+        if is_exported:
+            self.exports.append(node.name)
+            self.names.add(node.name)
+        
+        self.generic_visit(node)
+    
+    def visit_Assign(self, node: ast.Assign):
+        """Index top-level assignments (constants, variables)"""
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                name = target.id
+                if name.isupper() and name not in self.names:
+                    self.names.add(name)
+                    self.exports.append(name)
+        self.generic_visit(node)
+    
+    def _calculate_complexity(self, node) -> int:
+        """Calculate cyclomatic complexity"""
+        complexity = 1
+        for child in ast.walk(node):
+            if isinstance(child, (ast.If, ast.While, ast.For, ast.AsyncFor)):
+                complexity += 1
+            elif isinstance(child, ast.And) or isinstance(child, ast.Or):
+                complexity += 1
+            elif isinstance(child, ast.ExceptHandler):
+                complexity += 1
+        return complexity
+
+# ============================================
+# PROJECT SCANNER
+# ============================================
+
+class ProjectScanner:
+    """Scans and indexes an entire project"""
+    
+    def __init__(self, root_path: str):
+        self.root = Path(root_path).resolve()
+        self.index = ProjectIndex()
+        self.skip_patterns = DEFAULT_SKIP_PATTERNS
+        
+    def scan(self) -> ProjectIndex:
+        """Scan all Python files in the project"""
+        python_files = []
+        
+        # Collect all Python files
+        for py_file in self.root.rglob("*.py"):
+            if self._should_skip(py_file):
+                continue
+            python_files.append(py_file)
+        
+        # Index each file
+        for py_file in python_files:
+            try:
+                code = py_file.read_text(encoding='utf-8')
+                indexer = PythonIndexer(py_file)
+                file_index = indexer.index(code)
+                
+                # Store in project index
+                rel_path = str(py_file.relative_to(self.root))
+                self.index.files[rel_path] = file_index
+                
+                # Build export map
+                self.index.all_exports[rel_path] = file_index.exports
+                
+                # Build import map
+                self.index.all_imports[rel_path] = file_index.imports
+                
+                # Build dependency graph
+                imported_files = self._resolve_imports(file_index.imports, rel_path)
+                self.index.dependency_graph[rel_path] = imported_files
+                
+                # Store functions
+                for func in file_index.functions:
+                    func['file'] = rel_path
+                    self.index.all_functions.append(func)
+                
+                # Store classes
+                for cls in file_index.classes:
+                    cls['file'] = rel_path
+                    self.index.all_classes.append(cls)
+                    
+            except Exception as e:
+                print(f"Warning: Could not index {py_file}: {e}")
+        
+        # Build reverse dependency graph
+        self._build_reverse_graph()
+        
+        # Calculate metrics
+        self._calculate_metrics()
+        
+        # Infer naming conventions
+        self._infer_naming_conventions()
+        
+        return self.index
+    
+    def _should_skip(self, filepath: Path) -> bool:
+        """Check if file/dir should be skipped"""
+        parts = filepath.parts
+        
+        for pattern in self.skip_patterns:
+            if pattern.startswith('*'):
+                # Wildcard pattern
+                if pattern[1:] in filepath.name:
+                    return True
+            elif pattern in parts:
+                return True
+        
+        # Skip hidden directories (starting with .)
+        for part in parts:
+            if part.startswith('.') and part not in ['.git', '.github']:
+                if part not in ['.idea', '.vscode']:
+                    return True
+        
+        return False
+    
+    def _resolve_imports(self, imports: List[Dict], current_file: str) -> List[str]:
+        """Resolve import statements to file paths"""
+        resolved = []
+        current_dir = Path(current_file).parent
+        
+        for imp in imports:
+            source = imp['source']
+            
+            # Try to resolve as relative import
+            if source.startswith('.'):
+                # Relative import
+                parts = current_dir.parts
+                dots = 0
+                clean_source = source
+                while clean_source.startswith('.'):
+                    dots += 1
+                    clean_source = clean_source[1:]
+                
+                # Build relative path
+                rel_parts = list(parts[:-dots]) if dots > 0 else list(parts)
+                if clean_source:
+                    rel_parts.append(clean_source.replace('.', '/'))
+                rel_path = Path('/'.join(rel_parts))
+                resolved.append(str(rel_path) + '.py')
+            
+            elif source.startswith(self.root.name):
+                # Absolute import from root
+                rel_path = Path(source.replace('.', '/'))
+                resolved.append(str(rel_path) + '.py')
+            
+            else:
+                # Try to find in project
+                # Check if it's a known file
+                found = False
+                for filepath in self.index.files.keys():
+                    if filepath.endswith(f"{source.replace('.', '/')}.py"):
+                        resolved.append(filepath)
+                        found = True
+                        break
+                    if filepath.endswith(f"/{source.split('.')[-1]}.py"):
+                        resolved.append(filepath)
+                        found = True
+                        break
+                
+                if not found:
+                    # Could be external import, ignore
+                    pass
+        
+        return resolved
+    
+    def _build_reverse_graph(self):
+        """Build reverse dependency graph"""
+        self.index.import_graph_reverse = defaultdict(list)
+        
+        for filepath, imports in self.index.dependency_graph.items():
+            for imported in imports:
+                if imported in self.index.files:
+                    self.index.import_graph_reverse[imported].append(filepath)
+    
+    def _calculate_metrics(self):
+        """Calculate project metrics"""
+        if not self.index.all_functions:
+            return
+        
+        func_lines = [f.get('lines', 0) for f in self.index.all_functions if f.get('lines', 0) > 0]
+        func_params = [f.get('params', 0) for f in self.index.all_functions]
+        complexities = [f.get('complexity', 1) for f in self.index.all_functions]
+        
+        self.index.metrics = {
+            'total_files': len(self.index.files),
+            'total_functions': len(self.index.all_functions),
+            'total_classes': len(self.index.all_classes),
+            'total_lines': sum(f.lines for f in self.index.files.values()),
+            'avg_function_lines': sum(func_lines) / len(func_lines) if func_lines else 0,
+            'max_function_lines': max(func_lines) if func_lines else 0,
+            'avg_parameters': sum(func_params) / len(func_params) if func_params else 0,
+            'max_parameters': max(func_params) if func_params else 0,
+            'avg_complexity': sum(complexities) / len(complexities) if complexities else 0,
+            'max_complexity': max(complexities) if complexities else 0,
+        }
+        
+        # Calculate thresholds (90th percentile or sensible defaults)
+        self.index.metrics['thresholds'] = {
+            'function_lines': min(max(int(self.index.metrics['max_function_lines'] * 0.8), 30), 100),
+            'parameters': min(int(self.index.metrics['max_parameters'] * 0.8) + 1, 7),
+            'nesting': 4,
+            'complexity': min(int(self.index.metrics['max_complexity'] * 0.7) + 1, 15),
+        }
+    
+    def _infer_naming_conventions(self):
+        """Infer naming conventions from codebase"""
+        sample_functions = self.index.all_functions[:20]
+        sample_classes = self.index.all_classes[:10]
+        
+        snake_case_count = sum(1 for f in sample_functions if '_' in f['name'] and not f['name'].startswith('_'))
+        camel_case_count = sum(1 for f in sample_functions if f['name'][0].islower() and '_' not in f['name'])
+        pascal_case_count = sum(1 for c in sample_classes if c['name'][0].isupper())
+        
+        conventions = {
+            'classes': 'PascalCase' if pascal_case_count > len(sample_classes) / 2 else 'snake_case',
+            'functions': 'snake_case' if snake_case_count > camel_case_count else 'camelCase',
+            'constants': 'UPPER_CASE',
+            'private_methods': '_snake_case',
+        }
+        
+        self.index.naming_conventions = conventions
+
+# ============================================
+# RULE GENERATOR
+# ============================================
+
+class RuleGenerator:
+    """Generates .code-rules.json from project index"""
+    
+    def __init__(self, index: ProjectIndex, root_path: str):
+        self.index = index
+        self.root_path = Path(root_path).resolve()
+    
+    def generate(self) -> Dict:
+        """Generate complete rules"""
+        rules = {
+            'version': '1.0',
+            'project': {
+                'root': str(self.root_path),
+                'name': self.root_path.name,
+                'language': 'python',
+                'files_count': len(self.index.files),
+                'functions_count': len(self.index.all_functions),
+                'classes_count': len(self.index.all_classes),
+            },
+            'file_index': self._generate_file_index(),
+            'imports': self._generate_imports(),
+            'layers': self._infer_layers(),
+            'dependency_rules': self._infer_dependency_rules(),
+            'circular_dependencies': self._find_circular_dependencies(),
+            'naming': self.index.naming_conventions,
+            'metrics': self.index.metrics,
+            'forbidden_imports': self._infer_forbidden_imports(),
+        }
+        
+        return rules
+    
+    def _generate_file_index(self) -> Dict[str, Dict]:
+        """Generate complete file index with exportable and non-exportable items"""
+        file_index = {}
+        
+        for filepath, file_info in self.index.files.items():
+            exportable = []
+            non_exportable = []
+            
+            # Check functions
+            for func in file_info.functions:
+                name = func['name']
+                if name.startswith('_') or name in ['__init__', '__new__', '__call__']:
+                    non_exportable.append(name)
+                else:
+                    exportable.append(name)
+            
+            # Check classes
+            for cls in file_info.classes:
+                name = cls['name']
+                if name.startswith('_'):
+                    non_exportable.append(name)
+                else:
+                    exportable.append(name)
+            
+            file_index[filepath] = {
+                'exportable': sorted(exportable),
+                'non_exportable': sorted(non_exportable),
+                'functions': sorted([f['name'] for f in file_info.functions]),
+                'classes': sorted([c['name'] for c in file_info.classes]),
+                'lines': file_info.lines,
+            }
+        
+        return file_index
+    
+    def _generate_imports(self) -> Dict[str, List[str]]:
+        """Generate import map"""
+        imports = {}
+        for filepath, deps in self.index.dependency_graph.items():
+            if deps:
+                imports[filepath] = deps
+        return imports
+    
+    def _infer_layers(self) -> Dict[str, List[str]]:
+        """Infer layer structure from folder names"""
+        layers = {}
+        layer_keywords = {
+            'controllers': ['controller', 'api', 'routes', 'handlers', 'views', 'presentation', 'endpoints'],
+            'services': ['service', 'use_case', 'application', 'business', 'domain'],
+            'models': ['model', 'entity', 'schema', 'dto', 'value_object'],
+            'db': ['db', 'repository', 'infrastructure', 'persistence', 'dao', 'data'],
+            'utils': ['utils', 'helpers', 'common', 'shared', 'lib', 'core'],
+        }
+        
+        for filepath in self.index.files.keys():
+            path_parts = Path(filepath).parts
+            for layer, keywords in layer_keywords.items():
+                for keyword in keywords:
+                    if any(keyword in part.lower() for part in path_parts):
+                        if layer not in layers:
+                            layers[layer] = []
+                        for part in path_parts:
+                            if keyword in part.lower():
+                                layer_path = str(Path(*path_parts[:path_parts.index(part)+1]))
+                                if layer_path not in layers[layer]:
+                                    layers[layer].append(layer_path)
+                                break
+                        break
+        
+        if not layers:
+            layers['root'] = ['.']
+        
+        return layers
+    
+    def _infer_dependency_rules(self) -> Dict[str, Dict[str, List[str]]]:
+        """Infer dependency rules from actual usage"""
+        rules = {}
+        layers = self._infer_layers()
+        
+        layer_files = {}
+        for layer, paths in layers.items():
+            layer_files[layer] = []
+            for path in paths:
+                for filepath in self.index.files.keys():
+                    if filepath.startswith(path):
+                        layer_files[layer].append(filepath)
+        
+        for layer, files in layer_files.items():
+            imports = set()
+            for filepath in files:
+                for dep in self.index.dependency_graph.get(filepath, []):
+                    for other_layer, other_files in layer_files.items():
+                        if dep in other_files:
+                            imports.add(other_layer)
+                            break
+            
+            imports.discard(layer)
+            rules[layer] = {'can_import': sorted(list(imports)) if imports else []}
+        
+        return rules
+    
+    def _find_circular_dependencies(self) -> List[str]:
+        """Find circular dependencies in import graph"""
+        cycles = []
+        visited = set()
+        path = []
+        
+        def dfs(node, depth=0):
+            if depth > 20:
+                return
+            
+            if node in path:
+                cycle_start = path.index(node)
+                cycle = path[cycle_start:] + [node]
+                if len(set(cycle)) > 1:
+                    cycles.append(' -> '.join(cycle))
+                return
+            
+            if node in visited:
+                return
+            
+            visited.add(node)
+            path.append(node)
+            
+            for dep in self.index.dependency_graph.get(node, []):
+                dfs(dep, depth + 1)
+            
+            path.pop()
+        
+        for node in self.index.dependency_graph.keys():
+            dfs(node)
+        
+        return cycles[:10]
+    
+    def _infer_forbidden_imports(self) -> List[str]:
+        """Infer forbidden imports from layer rules"""
+        forbidden = []
+        layers = self._infer_layers()
+        
+        if 'controllers' in layers and 'db' in layers:
+            for controller_path in layers['controllers']:
+                for db_path in layers['db']:
+                    forbidden.append(f"{controller_path}/* -> {db_path}/*")
+        
+        if 'models' in layers and 'db' in layers:
+            for model_path in layers['models']:
+                for db_path in layers['db']:
+                    if model_path != db_path:
+                        forbidden.append(f"{model_path}/* -> {db_path}/*")
+        
+        if 'services' in layers and 'db' in layers:
+            for service_path in layers['services']:
+                for db_path in layers['db']:
+                    if service_path != db_path:
+                        forbidden.append(f"{service_path}/* -> {db_path}/*")
+        
+        return forbidden
+
+# ============================================
+# ENFORCER
+# ============================================
+
+class RuleEnforcer:
+    """Enforces rules against code"""
+    
+    def __init__(self, rules: Dict):
+        self.rules = rules
+        self.issues: List[Dict] = []
+    
+    def check_file(self, filepath: str, code: str) -> List[Dict]:
+        """Check a single file against rules"""
+        self.issues = []
+        
+        try:
+            tree = ast.parse(code, filename=filepath)
+        except SyntaxError as e:
+            return [{'line': e.lineno, 'message': f"Syntax error: {e}", 'severity': 'ERROR'}]
+        
+        self._check_exports(tree, filepath)
+        self._check_imports(tree, filepath)
+        self._check_naming(tree, filepath)
+        self._check_metrics(tree, filepath)
+        self._check_layer_violations(tree, filepath)
+        self._check_private_imports(tree, filepath)
+        
+        return self.issues
+    
+    def _check_exports(self, tree: ast.AST, filepath: str):
+        """Check if exports exist in the file"""
+        expected_exports = self.rules.get('file_index', {}).get(filepath, {}).get('exportable', [])
+        
+        actual_exports = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if not node.name.startswith('_'):
+                    actual_exports.append(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id.isupper():
+                        actual_exports.append(target.id)
+        
+        missing = set(expected_exports) - set(actual_exports)
+        if missing:
+            self.issues.append({
+                'line': 0,
+                'message': f"Missing exports: {', '.join(missing)}",
+                'severity': 'WARNING',
+                'check': 'missing_export'
+            })
+    
+    def _check_imports(self, tree: ast.AST, filepath: str):
+        """Check imports against rules"""
+        cycles = self.rules.get('circular_dependencies', [])
+        for cycle in cycles:
+            if filepath in cycle:
+                self.issues.append({
+                    'line': 0,
+                    'message': f"Circular dependency detected: {cycle}",
+                    'severity': 'ERROR',
+                    'check': 'circular_dependency'
+                })
+    
+    def _check_naming(self, tree: ast.AST, filepath: str):
+        """Check naming conventions"""
+        conventions = self.rules.get('naming', {})
+        class_convention = conventions.get('classes', 'PascalCase')
+        func_convention = conventions.get('functions', 'snake_case')
+        
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                if class_convention == 'PascalCase' and not node.name[0].isupper():
+                    self.issues.append({
+                        'line': node.lineno,
+                        'message': f"Class '{node.name}' should be PascalCase",
+                        'severity': 'INFO',
+                        'check': 'naming_convention'
+                    })
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name.startswith('_') and node.name != '__init__':
+                    continue
+                if func_convention == 'snake_case' and '_' not in node.name and not node.name[0].isupper():
+                    self.issues.append({
+                        'line': node.lineno,
+                        'message': f"Function '{node.name}' should be snake_case",
+                        'severity': 'INFO',
+                        'check': 'naming_convention'
+                    })
+    
+    def _check_metrics(self, tree: ast.AST, filepath: str):
+        """Check metrics thresholds"""
+        thresholds = self.rules.get('metrics', {}).get('thresholds', {})
+        max_lines = thresholds.get('function_lines', 50)
+        max_params = thresholds.get('parameters', 5)
+        max_nesting = thresholds.get('nesting', 4)
+        max_complexity = thresholds.get('complexity', 15)
+        
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                line_count = node.end_lineno - node.lineno + 1 if hasattr(node, 'end_lineno') else 0
+                if line_count > max_lines:
+                    self.issues.append({
+                        'line': node.lineno,
+                        'message': f"Function '{node.name}' has {line_count} lines (max: {max_lines})",
+                        'severity': 'WARNING',
+                        'check': 'function_length'
+                    })
+                
+                param_count = len(node.args.args)
+                if param_count > max_params:
+                    self.issues.append({
+                        'line': node.lineno,
+                        'message': f"Function '{node.name}' has {param_count} parameters (max: {max_params})",
+                        'severity': 'WARNING',
+                        'check': 'parameter_count'
+                    })
+                
+                complexity = self._calculate_complexity(node)
+                if complexity > max_complexity:
+                    self.issues.append({
+                        'line': node.lineno,
+                        'message': f"Function '{node.name}' has complexity {complexity} (max: {max_complexity})",
+                        'severity': 'WARNING',
+                        'check': 'complexity'
+                    })
+    
+    def _calculate_complexity(self, node) -> int:
+        """Calculate cyclomatic complexity"""
+        complexity = 1
+        for child in ast.walk(node):
+            if isinstance(child, (ast.If, ast.While, ast.For, ast.AsyncFor)):
+                complexity += 1
+            elif isinstance(child, (ast.And, ast.Or)):
+                complexity += 1
+            elif isinstance(child, ast.ExceptHandler):
+                complexity += 1
+        return complexity
+    
+    def _check_layer_violations(self, tree: ast.AST, filepath: str):
+        """Check layer violations"""
+        forbidden = self.rules.get('forbidden_imports', [])
+        
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                for rule in forbidden:
+                    if '->' in rule:
+                        source_pattern, target_pattern = rule.split('->')
+                        source_pattern = source_pattern.strip()
+                        target_pattern = target_pattern.strip()
+                        
+                        if Path(filepath).match(source_pattern.replace('/*', '*')):
+                            if Path(node.module).match(target_pattern.replace('/*', '*')):
+                                self.issues.append({
+                                    'line': node.lineno,
+                                    'message': f"Layer violation: {filepath} imports {node.module} (forbidden by rule: {rule})",
+                                    'severity': 'ERROR',
+                                    'check': 'layer_violation'
+                                })
+    
+    def _check_private_imports(self, tree: ast.AST, filepath: str):
+        """Check if AI code is importing non-exportable items"""
+        file_index = self.rules.get('file_index', {})
+        
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                # Check each imported name
+                for alias in node.names:
+                    import_name = alias.name
+                    # Look up which file this import comes from
+                    for rel_path, info in file_index.items():
+                        if rel_path.endswith(node.module.replace('.', '/') + '.py'):
+                            if import_name in info.get('non_exportable', []):
+                                self.issues.append({
+                                    'line': node.lineno,
+                                    'message': f"Importing private/non-exportable item '{import_name}' from {node.module} - should only import exportable items",
+                                    'severity': 'ERROR',
+                                    'check': 'private_import'
+                                })
+
+# ============================================
+# CLI
+# ============================================
+
+def generate_rules(root_path: str):
+    """Generate rules from project"""
+    print(f"📁 Scanning project: {root_path}")
+    
+    scanner = ProjectScanner(root_path)
+    index = scanner.scan()
+    
+    print(f"   Found {len(index.files)} Python files")
+    print(f"   Found {len(index.all_functions)} functions")
+    print(f"   Found {len(index.all_classes)} classes")
+    
+    generator = RuleGenerator(index, root_path)
+    rules = generator.generate()
+    
+    rules_file = Path(root_path) / '.code-rules.json'
+    with open(rules_file, 'w') as f:
+        json.dump(rules, f, indent=2)
+    
+    print(f"✅ Rules saved to {rules_file}")
+    print(f"   Layers detected: {list(rules['layers'].keys())}")
+    print(f"   Circular dependencies: {len(rules['circular_dependencies'])}")
+    print(f"   Max function lines threshold: {rules['metrics']['thresholds']['function_lines']}")
+    
+    return rules
+
+def show_rules(root_path: str):
+    """Display current rules"""
+    rules_file = Path(root_path) / '.code-rules.json'
+    
+    if not rules_file.exists():
+        print("❌ No .code-rules.json found. Run 'generate' first.")
+        return
+    
+    with open(rules_file) as f:
+        rules = json.load(f)
+    
+    print("\n📋 Current Rules:")
+    print(f"  Project: {rules['project']['name']}")
+    print(f"  Files: {rules['project']['files_count']}")
+    print(f"  Functions: {rules['project']['functions_count']}")
+    print(f"  Classes: {rules['project']['classes_count']}")
+    
+    print("\n  📁 File Index Summary:")
+    for filepath, info in rules['file_index'].items():
+        print(f"    {filepath}: {info['lines']} lines, {len(info['exportable'])} exportable, {len(info['non_exportable'])} private")
+    
+    print("\n  📁 Layers:")
+    for layer, paths in rules['layers'].items():
+        print(f"    {layer}: {', '.join(paths)}")
+    
+    print("\n  📊 Metrics:")
+    metrics = rules['metrics']
+    print(f"    Avg function lines: {metrics.get('avg_function_lines', 0):.1f}")
+    print(f"    Max function lines: {metrics.get('max_function_lines', 0)}")
+    print(f"    Avg parameters: {metrics.get('avg_parameters', 0):.1f}")
+    print(f"    Max parameters: {metrics.get('max_parameters', 0)}")
+    print(f"    Avg complexity: {metrics.get('avg_complexity', 0):.1f}")
+    print(f"    Max complexity: {metrics.get('max_complexity', 0)}")
+    
+    if rules['circular_dependencies']:
+        print("\n  ⚠️ Circular Dependencies Found:")
+        for cycle in rules['circular_dependencies']:
+            print(f"    {cycle}")
+
+def show_file_info(root_path: str, filepath: str):
+    """Display detailed info for a specific file"""
+    rules_file = Path(root_path) / '.code-rules.json'
+    
+    if not rules_file.exists():
+        print("❌ No .code-rules.json found. Run 'generate' first.")
+        return
+    
+    with open(rules_file) as f:
+        rules = json.load(f)
+    
+    file_path = Path(filepath)
+    rel_path = str(file_path.relative_to(root_path)) if file_path.is_relative_to(root_path) else str(file_path)
+    
+    if rel_path not in rules['file_index']:
+        print(f"❌ File not found in index: {filepath}")
+        return
+    
+    info = rules['file_index'][rel_path]
+    
+    print(f"\n📋 File: {rel_path}")
+    print(f"  Lines: {info['lines']}")
+    
+    print(f"\n  📤 Exportable ({len(info['exportable'])} items):")
+    for item in info['exportable']:
+        print(f"    - {item}")
+    
+    print(f"\n  🔒 Non-Exportable ({len(info['non_exportable'])} items):")
+    for item in info['non_exportable']:
+        print(f"    - {item}")
+    
+    print(f"\n  📦 Classes ({len(info['classes'])} items):")
+    for item in info['classes']:
+        print(f"    - {item}")
+    
+    print(f"\n  🔧 Functions ({len(info['functions'])} items):")
+    for item in info['functions']:
+        print(f"    - {item}")
+
+def check_file_cmd(root_path: str, filepath: str):
+    """Check a single file against rules"""
+    rules_file = Path(root_path) / '.code-rules.json'
+    
+    if not rules_file.exists():
+        print("❌ No .code-rules.json found. Run 'generate' first.")
+        sys.exit(1)
+    
+    with open(rules_file) as f:
+        rules = json.load(f)
+    
+    file_path = Path(filepath)
+    
+    if file_path.is_dir():
+        print(f"❌ '{filepath}' is a directory. Please specify a file.")
+        sys.exit(1)
+    
+    if not file_path.exists():
+        print(f"❌ File not found: {filepath}")
+        sys.exit(1)
+    
+    code = file_path.read_text(encoding='utf-8')
+    
+    enforcer = RuleEnforcer(rules)
+    rel_path = str(file_path.relative_to(root_path)) if file_path.is_relative_to(root_path) else str(file_path)
+    issues = enforcer.check_file(rel_path, code)
+    
+    if issues:
+        print(f"\n📋 Issues in {filepath}:")
+        for issue in issues:
+            line_str = f"Line {issue['line']}" if issue['line'] else "File level"
+            print(f"  [{issue['severity']}] {line_str}: {issue['message']}")
+        print(f"\n📊 Total: {len(issues)} issues")
+    else:
+        print(f"✅ No issues found in {filepath}")
+    
+    return issues
+
+def enforce_all(root_path: str):
+    """Enforce rules on all files"""
+    rules_file = Path(root_path) / '.code-rules.json'
+    if not rules_file.exists():
+        print("❌ No .code-rules.json found. Run 'generate' first.")
+        return
+    
+    with open(rules_file) as f:
+        rules = json.load(f)
+    
+    enforcer = RuleEnforcer(rules)
+    scanner = ProjectScanner(root_path)
+    index = scanner.scan()
+    
+    total_issues = 0
+    for filepath in index.files.keys():
+        full_path = Path(root_path) / filepath
+        code = full_path.read_text(encoding='utf-8')
+        issues = enforcer.check_file(filepath, code)
+        if issues:
+            print(f"\n📋 {filepath}:")
+            for issue in issues:
+                line_str = f"Line {issue['line']}" if issue['line'] else "File level"
+                print(f"  [{issue['severity']}] {line_str}: {issue['message']}")
+            total_issues += len(issues)
+    
+    print(f"\n📊 Total: {total_issues} issues across all files")
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    
+    command = sys.argv[1]
+    root_path = sys.argv[2] if len(sys.argv) > 2 else '.'
+    
+    if command == 'generate':
+        generate_rules(root_path)
+    
+    elif command == 'show':
+        show_rules(root_path)
+    
+    elif command == 'show-file':
+        if len(sys.argv) < 3:
+            print("Usage: python rulegen.py show-file <file>")
+            sys.exit(1)
+        show_file_info(root_path, sys.argv[2])
+    
+    elif command == 'check':
+        if len(sys.argv) < 3:
+            print("Usage: python rulegen.py check <file>")
+            sys.exit(1)
+        check_file_cmd(root_path, sys.argv[2])
+    
+    elif command == 'enforce':
+        enforce_all(root_path)
+    
+    else:
+        print(f"Unknown command: {command}")
+        print(__doc__)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
