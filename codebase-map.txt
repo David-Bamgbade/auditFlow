@@ -1,0 +1,835 @@
+#!/usr/bin/env python3
+"""
+codebase-map.py - Complete OOP Codebase Mapper
+
+Describes your entire codebase in object-oriented terms.
+Shows classes, constructors, methods, properties, fields, instances, inheritance,
+abstract classes, and interfaces - all from AST analysis.
+
+Usage:
+  python codebase-map.py generate         # Generate .code-map.json
+  python codebase-map.py show             # Show project overview
+  python codebase-map.py show-oop         # Show all OOP details
+  python codebase-map.py show-oop <file>  # Show OOP details for a file
+  python codebase-map.py inspect <file>   # Show what's in a file
+  python codebase-map.py validate <file>  # Validate against map
+  python codebase-map.py verify           # Validate all files
+"""
+
+import ast
+import sys
+import json
+import hashlib
+from pathlib import Path
+from typing import Dict, List, Set, Optional, Any
+from dataclasses import dataclass, field, asdict
+from collections import defaultdict
+
+# ============================================
+# SKIP PATTERNS
+# ============================================
+
+SKIP_PATTERNS = [
+    '__pycache__', 'venv', '.venv', 'env', '.env',
+    'node_modules', '.git', '.github',
+    'site-packages', 'dist-packages',
+    '.mypy_cache', '.pytest_cache', '.ruff_cache',
+    'build', 'dist',
+    '*.pyc', '*.pyo',
+    '*.egg-info',
+    '.idea', '.vscode',
+]
+
+# ============================================
+# DATA CLASSES
+# ============================================
+
+@dataclass
+class MethodInfo:
+    name: str
+    line: int
+    params: List[str]
+    is_async: bool = False
+    is_abstract: bool = False
+    is_static: bool = False
+    is_class: bool = False
+    is_property: bool = False
+    is_helper: bool = False
+    is_magic: bool = False
+    return_type: Optional[str] = None
+
+@dataclass
+class ObjectField:
+    name: str
+    line: int
+    type: Optional[str]
+    is_public: bool
+    is_static: bool = False
+
+@dataclass
+class ObjectInstance:
+    name: str
+    class_name: str
+    line: int
+    args: List[str]
+    is_public: bool
+
+@dataclass
+class ClassInfo:
+    name: str
+    line: int
+    is_public: bool
+    inherits_from: List[str]
+    constructor: Optional[MethodInfo]
+    object_methods: List[MethodInfo]
+    helper_methods: List[MethodInfo]
+    static_methods: List[MethodInfo]
+    class_methods: List[MethodInfo]
+    magic_methods: List[MethodInfo]
+    object_properties: List[MethodInfo]
+    object_fields: List[ObjectField]
+    object_instances: List[ObjectInstance]
+    is_abstract: bool
+    is_interface: bool
+    docstring: Optional[str]
+
+@dataclass
+class FunctionInfo:
+    name: str
+    line: int
+    is_public: bool
+    is_async: bool
+    params: List[str]
+    docstring: Optional[str]
+
+@dataclass
+class ConstantInfo:
+    name: str
+    line: int
+    value: Optional[str]
+
+@dataclass
+class FileInfo:
+    path: str
+    classes: List[ClassInfo]
+    functions: List[FunctionInfo]
+    constants: List[ConstantInfo]
+    imports: List[Dict]
+    lines: int
+    hash: str
+
+@dataclass
+class ProjectMap:
+    files: Dict[str, FileInfo] = field(default_factory=dict)
+    all_classes: List[ClassInfo] = field(default_factory=list)
+    all_functions: List[FunctionInfo] = field(default_factory=list)
+    all_constants: List[ConstantInfo] = field(default_factory=list)
+
+# ============================================
+# MAPPER
+# ============================================
+
+class CodeMapper(ast.NodeVisitor):
+    def __init__(self, filepath: Path):
+        self.filepath = filepath
+        self.classes: List[ClassInfo] = []
+        self.functions: List[FunctionInfo] = []
+        self.constants: List[ConstantInfo] = []
+        self.imports: List[Dict] = []
+        self.lines = 0
+        self.current_class: Optional[str] = None
+        self.current_methods: List[MethodInfo] = []
+        self.current_fields: List[ObjectField] = []
+        self.current_instances: List[ObjectInstance] = []
+        self.defined_classes: Set[str] = set()
+        
+    def map_file(self, code: str) -> FileInfo:
+        self.lines = len(code.splitlines())
+        try:
+            tree = ast.parse(code, filename=str(self.filepath))
+            # First pass: collect class names
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    self.defined_classes.add(node.name)
+            # Second pass: visit all nodes
+            self.visit(tree)
+        except SyntaxError:
+            pass
+        
+        return FileInfo(
+            path=str(self.filepath),
+            classes=self.classes,
+            functions=self.functions,
+            constants=self.constants,
+            imports=self.imports,
+            lines=self.lines,
+            hash=hashlib.md5(code.encode()).hexdigest()
+        )
+    
+    def visit_ClassDef(self, node: ast.ClassDef):
+        is_public = not node.name.startswith('_')
+        
+        # Get base classes
+        inherits_from = []
+        for base in node.bases:
+            if isinstance(base, ast.Name):
+                inherits_from.append(base.id)
+            elif isinstance(base, ast.Attribute):
+                inherits_from.append(base.attr)
+        
+        # Check if abstract
+        is_abstract = False
+        for child in node.body:
+            if isinstance(child, ast.FunctionDef):
+                for decorator in child.decorator_list:
+                    if isinstance(decorator, ast.Name) and decorator.id == 'abstractmethod':
+                        is_abstract = True
+                        break
+                if is_abstract:
+                    break
+        
+        # Check if interface (only abstract methods, no implementation)
+        is_interface = False
+        if is_abstract:
+            has_implementation = False
+            for child in node.body:
+                if isinstance(child, ast.FunctionDef):
+                    is_abstract_method = any(
+                        isinstance(d, ast.Name) and d.id == 'abstractmethod'
+                        for d in child.decorator_list
+                    )
+                    if not is_abstract_method and len(child.body) > 0:
+                        if not (len(child.body) == 1 and isinstance(child.body[0], ast.Pass)):
+                            has_implementation = True
+                            break
+            is_interface = not has_implementation
+        
+        # Store current class context
+        self.current_class = node.name
+        self.current_methods = []
+        self.current_fields = []
+        self.current_instances = []
+        
+        # Collect methods and fields
+        methods = []
+        helper_methods = []
+        static_methods = []
+        class_methods = []
+        magic_methods = []
+        properties = []
+        constructor = None
+        
+        for child in node.body:
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                method_info = self._extract_method_info(child)
+                
+                if method_info.is_magic and method_info.name == '__init__':
+                    constructor = method_info
+                elif method_info.is_magic:
+                    magic_methods.append(method_info)
+                elif method_info.is_static:
+                    static_methods.append(method_info)
+                elif method_info.is_class:
+                    class_methods.append(method_info)
+                elif method_info.is_property:
+                    properties.append(method_info)
+                elif method_info.is_helper:
+                    helper_methods.append(method_info)
+                else:
+                    methods.append(method_info)
+                
+                self.current_methods.append(method_info)
+            
+            elif isinstance(child, ast.Assign):
+                self._extract_fields(child)
+        
+        # Create class info
+        class_info = ClassInfo(
+            name=node.name,
+            line=node.lineno,
+            is_public=is_public,
+            inherits_from=inherits_from,
+            constructor=constructor,
+            object_methods=methods,
+            helper_methods=helper_methods,
+            static_methods=static_methods,
+            class_methods=class_methods,
+            magic_methods=magic_methods,
+            object_properties=properties,
+            object_fields=self.current_fields,
+            object_instances=[],  # Will be populated during visit_Call
+            is_abstract=is_abstract,
+            is_interface=is_interface,
+            docstring=ast.get_docstring(node)
+        )
+        
+        self.classes.append(class_info)
+        
+        # Visit child nodes to find instances
+        self.generic_visit(node)
+        
+        # Update instances after visiting body
+        class_info.object_instances = self.current_instances
+        
+        self.current_class = None
+        self.current_methods = []
+        self.current_fields = []
+        self.current_instances = []
+    
+    def _extract_method_info(self, node) -> MethodInfo:
+        name = node.name
+        is_magic = name.startswith('__') and name.endswith('__')
+        is_helper = name.startswith('_') and not is_magic
+        is_static = False
+        is_class = False
+        is_property = False
+        is_abstract = False
+        is_async = isinstance(node, ast.AsyncFunctionDef)
+        
+        # Check decorators
+        for decorator in node.decorator_list:
+            if isinstance(decorator, ast.Name):
+                if decorator.id == 'staticmethod':
+                    is_static = True
+                elif decorator.id == 'classmethod':
+                    is_class = True
+                elif decorator.id == 'property':
+                    is_property = True
+                elif decorator.id == 'abstractmethod':
+                    is_abstract = True
+        
+        # Get parameters (skip self/cls)
+        params = []
+        for arg in node.args.args:
+            if arg.arg not in ['self', 'cls']:
+                params.append(arg.arg)
+        
+        return MethodInfo(
+            name=name,
+            line=node.lineno,
+            params=params,
+            is_async=is_async,
+            is_abstract=is_abstract,
+            is_static=is_static,
+            is_class=is_class,
+            is_property=is_property,
+            is_helper=is_helper,
+            is_magic=is_magic,
+            return_type=None
+        )
+    
+    def _extract_fields(self, node: ast.Assign):
+        """Extract fields from assignments"""
+        for target in node.targets:
+            if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+                if target.value.id == 'self':
+                    name = target.attr
+                    is_public = not name.startswith('_')
+                    
+                    # Try to infer type
+                    type_str = None
+                    if isinstance(node.value, ast.Constant):
+                        type_str = type(node.value.value).__name__
+                    elif isinstance(node.value, ast.List):
+                        type_str = 'List'
+                    elif isinstance(node.value, ast.Dict):
+                        type_str = 'Dict'
+                    elif isinstance(node.value, ast.Set):
+                        type_str = 'Set'
+                    elif isinstance(node.value, ast.Tuple):
+                        type_str = 'Tuple'
+                    elif isinstance(node.value, ast.Call):
+                        if isinstance(node.value.func, ast.Name):
+                            type_str = node.value.func.id
+                    
+                    self.current_fields.append(ObjectField(
+                        name=name,
+                        line=node.lineno,
+                        type=type_str,
+                        is_public=is_public,
+                        is_static=False
+                    ))
+    
+    def visit_Call(self, node: ast.Call):
+        """Track object instantiations"""
+        if isinstance(node.func, ast.Name):
+            class_name = node.func.id
+            
+            # Check if it's a class (defined in this file or known)
+            if class_name in self.defined_classes or class_name in self._get_imported_classes():
+                # Get arguments
+                args = []
+                for arg in node.args:
+                    if isinstance(arg, ast.Constant):
+                        args.append(repr(arg.value))
+                    elif isinstance(arg, ast.Name):
+                        args.append(arg.id)
+                    elif isinstance(arg, ast.Str):
+                        args.append(repr(arg.s))
+                    else:
+                        args.append('...')
+                
+                # Check if the call is being assigned to a variable
+                parent = getattr(node, 'parent', None)
+                if isinstance(parent, ast.Assign):
+                    for target in parent.targets:
+                        if isinstance(target, ast.Name):
+                            self.current_instances.append(ObjectInstance(
+                                name=target.id,
+                                class_name=class_name,
+                                line=node.lineno,
+                                args=args,
+                                is_public=not target.id.startswith('_')
+                            ))
+        
+        self.generic_visit(node)
+    
+    def _get_imported_classes(self) -> Set[str]:
+        """Get classes imported from other files (simplified)"""
+        # This is a simplified version - full cross-file resolution would require more work
+        imported = set()
+        for imp in self.imports:
+            if imp['type'] == 'import_from':
+                # Check if import is a class (heuristic: starts with uppercase)
+                for alias in imp.get('aliases', []):
+                    if alias and alias[0].isupper():
+                        imported.add(alias)
+        return imported
+    
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        if self.current_class is None:
+            # Top-level function (not in class)
+            is_public = not node.name.startswith('_')
+            params = [arg.arg for arg in node.args.args]
+            self.functions.append(FunctionInfo(
+                name=node.name,
+                line=node.lineno,
+                is_public=is_public,
+                is_async=False,
+                params=params,
+                docstring=ast.get_docstring(node)
+            ))
+        self.generic_visit(node)
+    
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+        if self.current_class is None:
+            is_public = not node.name.startswith('_')
+            params = [arg.arg for arg in node.args.args]
+            self.functions.append(FunctionInfo(
+                name=node.name,
+                line=node.lineno,
+                is_public=is_public,
+                is_async=True,
+                params=params,
+                docstring=ast.get_docstring(node)
+            ))
+        self.generic_visit(node)
+    
+    def visit_Assign(self, node: ast.Assign):
+        """Extract top-level constants"""
+        if self.current_class is None:
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id.isupper():
+                    value_str = None
+                    if isinstance(node.value, ast.Constant):
+                        value_str = str(node.value.value)
+                    self.constants.append(ConstantInfo(
+                        name=target.id,
+                        line=node.lineno,
+                        value=value_str
+                    ))
+        self.generic_visit(node)
+    
+    def visit_Import(self, node: ast.Import):
+        for alias in node.names:
+            self.imports.append({
+                'source': alias.name,
+                'alias': alias.asname or alias.name,
+                'type': 'import',
+                'line': node.lineno
+            })
+        self.generic_visit(node)
+    
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        module = node.module or ''
+        for alias in node.names:
+            self.imports.append({
+                'source': f"{module}.{alias.name}" if module else alias.name,
+                'alias': alias.asname or alias.name,
+                'type': 'import_from',
+                'module': module,
+                'line': node.lineno
+            })
+        self.generic_visit(node)
+
+# ============================================
+# SCANNER
+# ============================================
+
+class Scanner:
+    def __init__(self, root_path: str):
+        self.root = Path(root_path).resolve()
+        self.map = ProjectMap()
+        
+    def scan(self) -> ProjectMap:
+        for py_file in self.root.rglob("*.py"):
+            if self._should_skip(py_file):
+                continue
+            self._scan_file(py_file)
+        
+        # Build global lists
+        for fileinfo in self.map.files.values():
+            self.map.all_classes.extend(fileinfo.classes)
+            self.map.all_functions.extend(fileinfo.functions)
+            self.map.all_constants.extend(fileinfo.constants)
+        
+        return self.map
+    
+    def _should_skip(self, filepath: Path) -> bool:
+        parts = filepath.parts
+        for pattern in SKIP_PATTERNS:
+            if pattern.startswith('*'):
+                if pattern[1:] in filepath.name:
+                    return True
+            elif pattern in parts:
+                return True
+        return False
+    
+    def _scan_file(self, filepath: Path):
+        try:
+            code = filepath.read_text(encoding='utf-8')
+            rel_path = str(filepath.relative_to(self.root))
+            mapper = CodeMapper(filepath)
+            fileinfo = mapper.map_file(code)
+            fileinfo.path = rel_path
+            self.map.files[rel_path] = fileinfo
+        except Exception as e:
+            print(f"Warning: Could not scan {filepath}: {e}")
+
+# ============================================
+# FORMATTERS
+# ============================================
+
+def format_class_info(cls: ClassInfo, indent: str = "") -> str:
+    """Format a class in OOP terms"""
+    lines = []
+    
+    # Class header
+    public_label = "Yes" if cls.is_public else "No"
+    abstract_label = "Yes" if cls.is_abstract else "No"
+    interface_label = "Yes" if cls.is_interface else "No"
+    inherits = ", ".join(cls.inherits_from) if cls.inherits_from else "None"
+    
+    lines.append(f"{indent}📦 {cls.name} (class) - line {cls.line}")
+    lines.append(f"{indent}   📤 Public: {public_label}")
+    lines.append(f"{indent}   🔗 Inherits from: {inherits}")
+    lines.append(f"{indent}   🎯 Abstract: {abstract_label}")
+    lines.append(f"{indent}   📋 Interface: {interface_label}")
+    
+    # Constructor
+    if cls.constructor:
+        params = ", ".join([p for p in cls.constructor.params if p != 'self'])
+        async_label = "async " if cls.constructor.is_async else ""
+        lines.append(f"{indent}\n   🏗️ Constructor: {async_label}__init__({params}) -> line {cls.constructor.line}")
+    else:
+        lines.append(f"{indent}\n   🏗️ Constructor: None")
+    
+    # Object Methods
+    if cls.object_methods:
+        lines.append(f"{indent}\n   📋 Object Methods ({len(cls.object_methods)}):")
+        for m in cls.object_methods:
+            params = ", ".join(m.params)
+            async_label = "async " if m.is_async else ""
+            abstract_label = " [ABSTRACT]" if m.is_abstract else ""
+            lines.append(f"{indent}     - {async_label}{m.name}({params}) -> line {m.line}{abstract_label}")
+    else:
+        lines.append(f"{indent}\n   📋 Object Methods: None")
+    
+    # Helper Methods
+    if cls.helper_methods:
+        lines.append(f"{indent}\n   📋 Helper Methods ({len(cls.helper_methods)}):")
+        for m in cls.helper_methods:
+            params = ", ".join(m.params)
+            lines.append(f"{indent}     - {m.name}({params}) -> line {m.line}")
+    
+    # Static Methods
+    if cls.static_methods:
+        lines.append(f"{indent}\n   📋 Static Methods ({len(cls.static_methods)}):")
+        for m in cls.static_methods:
+            params = ", ".join(m.params)
+            lines.append(f"{indent}     - {m.name}({params}) -> line {m.line}")
+    
+    # Class Methods
+    if cls.class_methods:
+        lines.append(f"{indent}\n   📋 Class Methods ({len(cls.class_methods)}):")
+        for m in cls.class_methods:
+            params = ", ".join(m.params)
+            lines.append(f"{indent}     - {m.name}({params}) -> line {m.line}")
+    
+    # Magic Methods
+    if cls.magic_methods:
+        lines.append(f"{indent}\n   📋 Magic Methods ({len(cls.magic_methods)}):")
+        for m in cls.magic_methods:
+            params = ", ".join(m.params)
+            lines.append(f"{indent}     - {m.name}({params}) -> line {m.line}")
+    
+    # Object Properties
+    if cls.object_properties:
+        lines.append(f"{indent}\n   📋 Object Properties ({len(cls.object_properties)}):")
+        for p in cls.object_properties:
+            lines.append(f"{indent}     - {p.name} -> line {p.line}")
+    else:
+        lines.append(f"{indent}\n   📋 Object Properties: None")
+    
+    # Object Fields
+    if cls.object_fields:
+        lines.append(f"{indent}\n   📦 Object Fields ({len(cls.object_fields)}):")
+        for f in cls.object_fields:
+            type_str = f" ({f.type})" if f.type else ""
+            visibility = "public" if f.is_public else "private"
+            lines.append(f"{indent}     - {f.name}{type_str} - {visibility}")
+    else:
+        lines.append(f"{indent}\n   📦 Object Fields: None")
+    
+    # Object Instances
+    if cls.object_instances:
+        lines.append(f"{indent}\n   🏗️ Object Instances Created ({len(cls.object_instances)}):")
+        for inst in cls.object_instances:
+            args_str = ", ".join(inst.args)
+            lines.append(f"{indent}     - {inst.name} = {inst.class_name}({args_str}) -> line {inst.line}")
+    else:
+        lines.append(f"{indent}\n   🏗️ Object Instances: None")
+    
+    return "\n".join(lines)
+
+def format_function_info(func: FunctionInfo, indent: str = "") -> str:
+    """Format a top-level function"""
+    public_label = "Yes" if func.is_public else "No"
+    async_label = "async " if func.is_async else ""
+    params = ", ".join(func.params)
+    lines = [
+        f"{indent}🔧 {async_label}{func.name}({params}) -> line {func.line}",
+        f"{indent}   📤 Public: {public_label}"
+    ]
+    if func.docstring:
+        lines.append(f"{indent}   📝 {func.docstring[:50]}...")
+    return "\n".join(lines)
+
+def format_constant_info(const: ConstantInfo, indent: str = "") -> str:
+    """Format a top-level constant"""
+    value_str = f" = {const.value}" if const.value else ""
+    return f"{indent}📊 {const.name}{value_str} -> line {const.line}"
+
+# ============================================
+# COMMANDS
+# ============================================
+
+def generate_map(root_path: str):
+    """Generate .code-map.json from the codebase"""
+    print(f"📁 Mapping: {root_path}")
+    scanner = Scanner(root_path)
+    map_data = scanner.scan()
+    
+    map_file = Path(root_path) / '.code-map.json'
+    with open(map_file, 'w') as f:
+        data = {
+            'files': {path: asdict(entry) for path, entry in map_data.files.items()},
+        }
+        json.dump(data, f, indent=2, default=str)
+    
+    total_classes = sum(len(f.classes) for f in map_data.files.values())
+    total_functions = sum(len(f.functions) for f in map_data.files.values())
+    total_constants = sum(len(f.constants) for f in map_data.files.values())
+    
+    print(f"✅ Mapped {len(map_data.files)} files")
+    print(f"   📦 Classes: {total_classes}")
+    print(f"   🔧 Functions: {total_functions}")
+    print(f"   📊 Constants: {total_constants}")
+
+def show_info(root_path: str):
+    """Show project overview from the map"""
+    map_file = Path(root_path) / '.code-map.json'
+    if not map_file.exists():
+        print("❌ Run 'generate' first")
+        return
+    
+    with open(map_file) as f:
+        data = json.load(f)
+    
+    total_classes = 0
+    total_functions = 0
+    total_constants = 0
+    total_items = 0
+    
+    for entry in data['files'].values():
+        total_classes += len(entry['classes'])
+        total_functions += len(entry['functions'])
+        total_constants += len(entry['constants'])
+        total_items += len(entry['classes']) + len(entry['functions']) + len(entry['constants'])
+    
+    print(f"\n📋 Project: {Path(root_path).name}")
+    print(f"   📁 Files: {len(data['files'])}")
+    print(f"   📦 Total Items: {total_items}")
+    print(f"   📦 Classes: {total_classes}")
+    print(f"   🔧 Functions: {total_functions}")
+    print(f"   📊 Constants: {total_constants}")
+    
+    print("\n📁 Files with most classes:")
+    sorted_files = sorted(
+        [(path, len(entry['classes'])) for path, entry in data['files'].items()],
+        key=lambda x: x[1],
+        reverse=True
+    )[:5]
+    for path, count in sorted_files:
+        if count > 0:
+            print(f"   {path}: {count} classes")
+
+def show_oop_info(root_path: str, filepath: str = None):
+    """Show OOP details for classes in the project or a specific file"""
+    map_file = Path(root_path) / '.code-map.json'
+    if not map_file.exists():
+        print("❌ Run 'generate' first")
+        return
+    
+    with open(map_file) as f:
+        data = json.load(f)
+    
+    # Rebuild ClassInfo objects from dict
+    def dict_to_classinfo(d):
+        return ClassInfo(
+            name=d['name'],
+            line=d['line'],
+            is_public=d['is_public'],
+            inherits_from=d['inherits_from'],
+            constructor=MethodInfo(**d['constructor']) if d.get('constructor') else None,
+            object_methods=[MethodInfo(**m) for m in d.get('object_methods', [])],
+            helper_methods=[MethodInfo(**m) for m in d.get('helper_methods', [])],
+            static_methods=[MethodInfo(**m) for m in d.get('static_methods', [])],
+            class_methods=[MethodInfo(**m) for m in d.get('class_methods', [])],
+            magic_methods=[MethodInfo(**m) for m in d.get('magic_methods', [])],
+            object_properties=[MethodInfo(**m) for m in d.get('object_properties', [])],
+            object_fields=[ObjectField(**f) for f in d.get('object_fields', [])],
+            object_instances=[ObjectInstance(**i) for i in d.get('object_instances', [])],
+            is_abstract=d['is_abstract'],
+            is_interface=d['is_interface'],
+            docstring=d.get('docstring')
+        )
+    
+    if filepath:
+        # Show OOP details for a specific file
+        file_path = Path(filepath)
+        rel_path = str(file_path.relative_to(root_path)) if file_path.is_relative_to(root_path) else str(file_path)
+        if rel_path not in data['files']:
+            print(f"❌ File not in map: {filepath}")
+            return
+        files_to_show = {rel_path: data['files'][rel_path]}
+    else:
+        files_to_show = data['files']
+    
+    print(f"\n📋 OOP Details:")
+    
+    for path, entry in files_to_show.items():
+        if not entry['classes']:
+            continue
+        
+        print(f"\n📁 {path}:")
+        for cls_data in entry['classes']:
+            cls = dict_to_classinfo(cls_data)
+            print(format_class_info(cls, "  "))
+            print()
+
+def inspect_file(root_path: str, filepath: str):
+    """Show what's in a specific file"""
+    map_file = Path(root_path) / '.code-map.json'
+    if not map_file.exists():
+        print("❌ Run 'generate' first")
+        return
+    
+    with open(map_file) as f:
+        data = json.load(f)
+    
+    file_path = Path(filepath)
+    rel_path = str(file_path.relative_to(root_path)) if file_path.is_relative_to(root_path) else str(file_path)
+    
+    if rel_path not in data['files']:
+        print(f"❌ File not in map: {filepath}")
+        return
+    
+    entry = data['files'][rel_path]
+    
+    print(f"\n📋 {rel_path}")
+    print(f"   Lines: {entry['lines']}")
+    print(f"   Classes: {len(entry['classes'])}")
+    print(f"   Functions: {len(entry['functions'])}")
+    print(f"   Constants: {len(entry['constants'])}")
+    
+    if entry['classes']:
+        print("\n   📦 Classes:")
+        for cls in entry['classes']:
+            public_label = "public" if cls['is_public'] else "private"
+            print(f"     - {cls['name']} ({public_label}) - line {cls['line']}")
+    
+    if entry['functions']:
+        print("\n   🔧 Functions:")
+        for func in entry['functions']:
+            public_label = "public" if func['is_public'] else "private"
+            print(f"     - {func['name']} ({public_label}) - line {func['line']}")
+    
+    if entry['constants']:
+        print("\n   📊 Constants:")
+        for const in entry['constants']:
+            value_str = f" = {const['value']}" if const['value'] else ""
+            print(f"     - {const['name']}{value_str} - line {const['line']}")
+
+def validate_file(root_path: str, filepath: str):
+    """Validate a single file against the map (stub)"""
+    print(f"🔍 Validating: {filepath}")
+    print("   Validation rules coming soon...")
+
+def verify_all(root_path: str, strict: bool = False):
+    """Validate all files against the map (stub)"""
+    print(f"🔍 Verifying all files in: {root_path}")
+    print("   Validation rules coming soon...")
+
+# ============================================
+# MAIN
+# ============================================
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    
+    command = sys.argv[1]
+    root = sys.argv[2] if len(sys.argv) > 2 else '.'
+    
+    # Check for --strict flag
+    strict = '--strict' in sys.argv
+    
+    if command == 'generate':
+        generate_map(root)
+    elif command == 'show':
+        show_info(root)
+    elif command == 'show-oop':
+        if len(sys.argv) >= 3 and not sys.argv[2].startswith('--'):
+            show_oop_info(root, sys.argv[2])
+        else:
+            show_oop_info(root)
+    elif command == 'inspect':
+        if len(sys.argv) < 3:
+            print("Usage: python codebase-map.py inspect <file>")
+            sys.exit(1)
+        inspect_file(root, sys.argv[2])
+    elif command == 'validate':
+        if len(sys.argv) < 3:
+            print("Usage: python codebase-map.py validate <file>")
+            sys.exit(1)
+        validate_file(root, sys.argv[2])
+    elif command == 'verify':
+        verify_all(root, strict)
+    else:
+        print(f"Unknown: {command}")
+        print(__doc__)
+
+if __name__ == "__main__":
+    main()
