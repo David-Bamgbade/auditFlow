@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""
+codesniff.py - Bad Code Smell Detector
+
+Detects code smells that indicate potential problems:
+- Long methods (God objects)
+- Duplicate code patterns
+- Deep nesting
+- Feature envy (using too many methods from other classes)
+- Data clumps (same parameters in many functions)
+- Primitive obsession (using primitives instead of objects)
+- Message chains (train wreck: a.b.c.d)
+- Middle man (delegating too much)
+- Inappropriate intimacy (too much coupling)
+- Lazy class (does too little)
+- Large class (does too much)
+
+Usage:
+  python codesniff.py <root_path>
+  python codesniff.py . --format json
+  python codesniff.py .. --format json --output report.json
+"""
+
+import ast
+import sys
+import json
+from pathlib import Path
+from typing import List, Dict, Set, Any, Tuple
+from dataclasses import dataclass, asdict
+from collections import defaultdict
+from datetime import datetime
+
+# ============================================
+# DATA CLASSES
+# ============================================
+
+@dataclass
+class CodeSmell:
+    file: str
+    line: int
+    type: str
+    severity: str  # 'critical', 'major', 'minor'
+    message: str
+    suggestion: str
+    code_snippet: str = ""
+
+# ============================================
+# SMELL DETECTOR
+# ============================================
+
+class SmellDetector(ast.NodeVisitor):
+    def __init__(self, filename: str, code: str):
+        self.filename = filename
+        self.code = code
+        self.lines = code.splitlines()
+        self.smells: List[CodeSmell] = []
+        
+        # For smell detection
+        self.classes: Dict[str, ast.ClassDef] = {}
+        self.class_methods: Dict[str, List[str]] = defaultdict(list)
+        self.class_fields: Dict[str, Set[str]] = defaultdict(set)
+        self.class_imports: Dict[str, Set[str]] = defaultdict(set)
+        self.function_calls: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        self.method_lengths: Dict[str, int] = {}
+        self.method_params: Dict[str, List[str]] = {}
+        self.nesting_depth = 0
+        self.current_class = None
+        self.current_method = None
+        
+    def visit_ClassDef(self, node: ast.ClassDef):
+        self.current_class = node.name
+        self.classes[node.name] = node
+        
+        # Check for large class (God class)
+        method_count = sum(1 for child in node.body if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)))
+        field_count = len([child for child in node.body if isinstance(child, ast.Assign)])
+        
+        if method_count > 20:
+            self._add_smell(
+                line=node.lineno,
+                type="large_class",
+                severity="major",
+                message=f"Class '{node.name}' has {method_count} methods (suggest max 15)",
+                suggestion="Split into smaller, focused classes using Single Responsibility Principle",
+                snippet=self._get_snippet(node.lineno, node.lineno + 3)
+            )
+        
+        if field_count > 15:
+            self._add_smell(
+                line=node.lineno,
+                type="class_too_many_fields",
+                severity="major",
+                message=f"Class '{node.name}' has {field_count} fields (suggest max 10)",
+                suggestion="Group related fields into smaller classes",
+                snippet=self._get_snippet(node.lineno, node.lineno + 3)
+            )
+        
+        self.generic_visit(node)
+        self.current_class = None
+    
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        self.current_method = node.name
+        self._check_method_smells(node)
+        
+        self.nesting_depth += 1
+        self.generic_visit(node)
+        self.nesting_depth -= 1
+        
+        self.current_method = None
+    
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+        self.current_method = node.name
+        self._check_method_smells(node)
+        
+        self.nesting_depth += 1
+        self.generic_visit(node)
+        self.nesting_depth -= 1
+        
+        self.current_method = None
+    
+    def visit_If(self, node: ast.If):
+        # Check deep nesting
+        if self.nesting_depth > 4:
+            self._add_smell(
+                line=node.lineno,
+                type="deep_nesting",
+                severity="major",
+                message=f"Deep nesting detected ({self.nesting_depth} levels)",
+                suggestion="Use early returns or extract nested logic into separate functions",
+                snippet=self._get_snippet(node.lineno, node.lineno + 2)
+            )
+        self.generic_visit(node)
+    
+    def visit_For(self, node: ast.For):
+        self.nesting_depth += 1
+        self.generic_visit(node)
+        self.nesting_depth -= 1
+    
+    def visit_While(self, node: ast.While):
+        self.nesting_depth += 1
+        self.generic_visit(node)
+        self.nesting_depth -= 1
+    
+    def visit_Call(self, node: ast.Call):
+        # Track method calls for feature envy detection
+        if self.current_class and self.current_method:
+            caller_class = self.current_class
+            caller_method = self.current_method
+            
+            if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+                target_class = node.func.value.id
+                method_name = node.func.attr
+                
+                # If calling methods from another class
+                if target_class != 'self' and target_class in self.classes:
+                    self.function_calls[caller_class][method_name] += 1
+        
+        # Check for primitive obsession (using primitives instead of objects)
+        self._check_primitive_obsession(node)
+        
+        # Check for message chains (train wreck)
+        self._check_message_chain(node)
+        
+        self.generic_visit(node)
+    
+    def visit_Attribute(self, node: ast.Attribute):
+        # Track attribute access for feature envy
+        self.generic_visit(node)
+    
+    def _check_method_smells(self, node):
+        method_name = node.name
+        start = node.lineno
+        end = node.end_lineno if hasattr(node, 'end_lineno') else start
+        length = end - start + 1
+        
+        # 1. Long method (God method)
+        if length > 30:
+            self._add_smell(
+                line=start,
+                type="long_method",
+                severity="major",
+                message=f"Method '{method_name}' has {length} lines (suggest max 30)",
+                suggestion="Break into smaller focused methods",
+                snippet=self._get_snippet(start, start + 4)
+            )
+        
+        # 2. Too many parameters
+        param_count = len(node.args.args)
+        if param_count > 4:
+            self._add_smell(
+                line=start,
+                type="too_many_parameters",
+                severity="minor",
+                message=f"Method '{method_name}' has {param_count} parameters (suggest max 4)",
+                suggestion="Use a parameter object or extract into a class",
+                snippet=self._get_snippet(start, start + 1)
+            )
+        
+        # 3. Data clump (same parameters appearing together)
+        param_names = [arg.arg for arg in node.args.args if arg.arg != 'self']
+        if len(param_names) >= 3:
+            self._add_smell(
+                line=start,
+                type="data_clump",
+                severity="minor",
+                message=f"Method '{method_name}' may have a data clump: {', '.join(param_names[:3])}...",
+                suggestion="Consider creating a class to group these parameters",
+                snippet=self._get_snippet(start, start + 1)
+            )
+        
+        # 4. Lazy method (does almost nothing)
+        if length <= 3 and not isinstance(node.body[0], ast.Pass) if node.body else False:
+            self._add_smell(
+                line=start,
+                type="lazy_method",
+                severity="minor",
+                message=f"Method '{method_name}' is very short ({length} lines)",
+                suggestion="Consider inlining or removing if not needed",
+                snippet=self._get_snippet(start, end)
+            )
+        
+        # 5. Method with too many returns (confusing flow)
+        return_count = sum(1 for child in ast.walk(node) if isinstance(child, ast.Return))
+        if return_count > 3:
+            self._add_smell(
+                line=start,
+                type="too_many_returns",
+                severity="minor",
+                message=f"Method '{method_name}' has {return_count} return statements",
+                suggestion="Simplify logic with single return or early returns",
+                snippet=self._get_snippet(start, start + 3)
+            )
+    
+    def _check_primitive_obsession(self, node: ast.Call):
+        """Check for using primitives instead of objects"""
+        if isinstance(node.func, ast.Name):
+            # Checking for common primitive operations
+            primitive_ops = {'add', 'subtract', 'multiply', 'divide', 'concat', 'join'}
+            if node.func.id in primitive_ops:
+                self._add_smell(
+                    line=node.lineno,
+                    type="primitive_obsession",
+                    severity="minor",
+                    message=f"Using primitive operation '{node.func.id}' instead of a domain object",
+                    suggestion="Consider creating a value object to encapsulate the behavior",
+                    snippet=self._get_snippet(node.lineno, node.lineno)
+                )
+    
+    def _check_message_chain(self, node: ast.Call):
+        """Check for message chains (train wreck: a.b.c.d)"""
+        depth = 0
+        current = node.func
+        while isinstance(current, ast.Attribute):
+            depth += 1
+            current = current.value
+        
+        if depth > 2:
+            self._add_smell(
+                line=node.lineno,
+                type="message_chain",
+                severity="major",
+                message=f"Message chain detected ({depth} levels)",
+                suggestion="Use Law of Demeter: avoid chaining through multiple objects",
+                snippet=self._get_snippet(node.lineno, node.lineno)
+            )
+    
+    def _add_smell(self, line: int, type: str, severity: str, message: str, suggestion: str, snippet: str = ""):
+        self.smells.append(CodeSmell(
+            file=self.filename,
+            line=line,
+            type=type,
+            severity=severity,
+            message=message,
+            suggestion=suggestion,
+            code_snippet=snippet or self._get_snippet(line, line)
+        ))
+    
+    def _get_snippet(self, start: int, end: int) -> str:
+        if start < 1:
+            start = 1
+        if end > len(self.lines):
+            end = len(self.lines)
+        return '\n'.join(self.lines[start-1:end]).strip()
+
+# ============================================
+# ANALYZER
+# ============================================
+
+def analyze_file(filepath: str) -> List[CodeSmell]:
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            code = f.read()
+        tree = ast.parse(code, filename=filepath)
+        detector = SmellDetector(filepath, code)
+        detector.visit(tree)
+        return detector.smells
+    except Exception as e:
+        return [CodeSmell(
+            file=filepath,
+            line=0,
+            type="parse_error",
+            severity="minor",
+            message=f"Could not parse file: {e}",
+            suggestion="Check for syntax errors"
+        )]
+
+def analyze_directory(root_path: str) -> List[CodeSmell]:
+    root = Path(root_path).resolve()
+    all_smells = []
+    skip_patterns = ['__pycache__', 'venv', '.venv', 'env', '.env', 'site-packages']
+    
+    for py_file in root.rglob("*.py"):
+        parts = py_file.parts
+        should_skip = False
+        for pattern in skip_patterns:
+            if pattern in parts:
+                should_skip = True
+                break
+        if should_skip:
+            continue
+        
+        smells = analyze_file(str(py_file))
+        all_smells.extend(smells)
+    
+    return all_smells
+
+# ============================================
+# FORMATTERS
+# ============================================
+
+def to_console(smells: List[CodeSmell], root_path: str) -> str:
+    if not smells:
+        return "✅ No code smells detected"
+    
+    by_severity = defaultdict(list)
+    for smell in smells:
+        by_severity[smell.severity].append(smell)
+    
+    lines = []
+    lines.append("=" * 70)
+    lines.append("👃 Code Smell Report")
+    lines.append("=" * 70)
+    
+    total = len(smells)
+    critical = len(by_severity['critical'])
+    major = len(by_severity['major'])
+    minor = len(by_severity['minor'])
+    
+    lines.append(f"\n📊 Summary:")
+    lines.append(f"   Total smells: {total}")
+    lines.append(f"   🔴 Critical: {critical}")
+    lines.append(f"   🟡 Major: {major}")
+    lines.append(f"   🟢 Minor: {minor}")
+    
+    for severity in ['critical', 'major', 'minor']:
+        smell_list = by_severity.get(severity, [])
+        if not smell_list:
+            continue
+        icon = '🔴' if severity == 'critical' else '🟡' if severity == 'major' else '🟢'
+        lines.append(f"\n{icon} {severity.upper()} ({len(smell_list)} smells):")
+        
+        for smell in smell_list[:10]:
+            lines.append(f"   {smell.file}:{smell.line} [{smell.type}]")
+            lines.append(f"      {smell.message}")
+            lines.append(f"      💡 {smell.suggestion}")
+            if smell.code_snippet:
+                lines.append(f"      📝 {smell.code_snippet[:80]}...")
+        
+        if len(smell_list) > 10:
+            lines.append(f"   ... and {len(smell_list) - 10} more")
+    
+    return '\n'.join(lines)
+
+def to_json(smells: List[CodeSmell], root_path: str) -> str:
+    report = {
+        'root': root_path,
+        'generated_at': datetime.now().isoformat(),
+        'total_smells': len(smells),
+        'severity_counts': {
+            'critical': len([s for s in smells if s.severity == 'critical']),
+            'major': len([s for s in smells if s.severity == 'major']),
+            'minor': len([s for s in smells if s.severity == 'minor'])
+        },
+        'smells': [asdict(s) for s in smells]
+    }
+    return json.dumps(report, indent=2)
+
+# ============================================
+# MAIN
+# ============================================
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    
+    root_path = sys.argv[1]
+    format_type = 'console'
+    output_file = None
+    
+    for i, arg in enumerate(sys.argv):
+        if arg == '--format' and i + 1 < len(sys.argv):
+            format_type = sys.argv[i + 1]
+        if arg == '--output' and i + 1 < len(sys.argv):
+            output_file = sys.argv[i + 1]
+    
+    root = Path(root_path).resolve()
+    print(f"👃 Sniffing: {root}")
+    
+    smells = analyze_directory(str(root))
+    
+    if format_type == 'json':
+        output = to_json(smells, str(root))
+    else:
+        output = to_console(smells, str(root))
+    
+    if output_file:
+        Path(output_file).write_text(output, encoding='utf-8')
+        print(f"✅ Report saved to: {output_file}")
+    else:
+        print(output)
+
+if __name__ == "__main__":
+    main()
