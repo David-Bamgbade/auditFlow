@@ -1,0 +1,162 @@
+# archmap.py
+import ast
+import sys
+from pathlib import Path
+from typing import List
+
+def get_abs_path_from_ast(filepath: str) -> str:
+    """Get absolute path from AST"""
+    with open(filepath, 'r', encoding='utf-8') as f:
+        code = f.read()
+    ast.parse(code, filename=filepath)
+    return str(Path(filepath).resolve())
+
+def find_common_ancestor(paths: List[str]) -> str:
+    """Find the common ancestor of all paths"""
+    if not paths:
+        return '.'
+    
+    path_objs = [Path(p).resolve() for p in paths]
+    common = path_objs[0].parent
+    
+    for p in path_objs:
+        while True:
+            try:
+                if p.is_relative_to(common):
+                    break
+            except ValueError:
+                pass
+            common = common.parent
+    
+    return str(common)
+
+def get_all_python_files(root_path: str) -> List[str]:
+    """Get all Python files from root path"""
+    root = Path(root_path).resolve()
+    
+    if root.is_file():
+        root = root.parent
+    
+    skip_patterns = ['__pycache__', 'venv', '.venv', 'env', '.env', 'node_modules', '.git', 'site-packages']
+    
+    files = []
+    for py_file in root.rglob("*.py"):
+        parts = py_file.parts
+        should_skip = False
+        for pattern in skip_patterns:
+            if pattern in parts:
+                should_skip = True
+                break
+        if not should_skip:
+            files.append(str(py_file))
+    
+    return files
+
+def find_project_root(start_path: str) -> str:
+    """Find project root by scanning upward until we find Python files"""
+    start = Path(start_path).resolve()
+    
+    if start.is_file():
+        start = start.parent
+    
+    # Walk up until we find a directory with Python files
+    current = start
+    while current != current.parent:
+        py_files = list(current.glob("*.py"))
+        if py_files:
+            return str(current)
+        current = current.parent
+    
+    return str(start)
+
+def analyze_architecture(root_path: str):
+    """Main architecture analysis"""
+    # Resolve the path
+    root = Path(root_path).resolve()
+    
+    # If the path doesn't exist, try to find it
+    if not root.exists():
+        print(f"❌ Path does not exist: {root}")
+        # Try to find the project root by scanning up
+        detected = find_project_start_from_current()
+        if detected:
+            print(f"💡 Did you mean: {detected}")
+            root = Path(detected)
+        else:
+            return
+    
+    print(f"📁 Root: {root}")
+    
+    # Get all Python files
+    py_files = get_all_python_files(str(root))
+    print(f"📁 Found {len(py_files)} Python files")
+    
+    if not py_files:
+        print("⚠️ No Python files found")
+        return
+    
+    # Get absolute paths from AST
+    abs_paths = []
+    for f in py_files:
+        try:
+            abs_path = get_abs_path_from_ast(f)
+            abs_paths.append(abs_path)
+        except Exception:
+            pass
+    
+    # Find common ancestor (should be the root)
+    detected_root = find_common_ancestor(abs_paths)
+    print(f"📍 AST-detected root: {detected_root}")
+    
+    # Build layer map from folder structure
+    layers = {}
+    for f in py_files:
+        rel_path = Path(f).relative_to(root)
+        parts = rel_path.parts
+        if len(parts) > 1:
+            layer = parts[0]
+        else:
+            layer = 'root'
+        
+        if layer not in layers:
+            layers[layer] = []
+        layers[layer].append(str(rel_path))
+    
+    # Print layers
+    print("\n📁 Layers:")
+    for layer, files in layers.items():
+        print(f"   {layer} ({len(files)} files)")
+        for f in files[:5]:
+            print(f"      - {f}")
+        if len(files) > 5:
+            print(f"      ... and {len(files) - 5} more")
+
+def find_project_start_from_current() -> str:
+    """Find the project root from current directory by walking up"""
+    current = Path.cwd()
+    
+    # Walk up until we find a directory with Python files
+    while current != current.parent:
+        py_files = list(current.rglob("*.py"))
+        if len(py_files) >= 3:
+            return str(current)
+        current = current.parent
+    
+    return None
+
+# ============================================
+# MAIN
+# ============================================
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python archmap.py <root_path>")
+        print("Example: python archmap.py .")
+        print("Example: python archmap.py ..")
+        print("Example: python archmap.py C:/Users/dell/Desktop/ai-slop")
+        print("")
+        print("💡 If path doesn't exist, it will try to auto-detect.")
+        sys.exit(1)
+    
+    root_path = sys.argv[1]
+    analyze_architecture(root_path)
