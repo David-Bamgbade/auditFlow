@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+"""
+archscan.py - Code Quality Scanner
+
+Scans all Python files for:
+- Performance issues (slow loops, repeated work)
+- Memory inefficiencies (large lists, no generators)
+- Code quality (imports in functions, dead code)
+- Unnecessary complexity
+
+Usage:
+  python archscan.py <root_path>
+  python archscan.py . --report json
+  python archscan.py .. --format json --output report.json
+"""
+
+import ast
+import sys
+import json
+from pathlib import Path
+from typing import List, Dict, Set, Any, Optional
+from dataclasses import dataclass, asdict
+from collections import defaultdict
+from datetime import datetime
+
+# ============================================
+# DATA CLASSES
+# ============================================
+
+@dataclass
+class Issue:
+    file: str
+    line: int
+    type: str
+    severity: str
+    message: str
+    suggestion: str
+    code_snippet: str = ""
+
+# ============================================
+# SCANNER
+# ============================================
+
+class CodeScanner(ast.NodeVisitor):
+    def __init__(self, filename: str, code: str):
+        self.filename = filename
+        self.code = code
+        self.issues: List[Issue] = []
+        self.lines = code.splitlines()
+        self.in_loop = False
+        self.loop_depth = 0
+        self.defined_functions: Set[str] = set()
+        self.defined_classes: Set[str] = set()
+        self.imports: Set[str] = set()
+        self.current_function: Optional[str] = None
+        self.current_class: Optional[str] = None
+        self.function_calls: Dict[str, int] = defaultdict(int)
+        
+    def visit_Import(self, node: ast.Import):
+        for alias in node.names:
+            self.imports.add(alias.name)
+        self.generic_visit(node)
+    
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        if node.module:
+            self.imports.add(node.module)
+        for alias in node.names:
+            self.imports.add(alias.name)
+        self.generic_visit(node)
+    
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        self.defined_functions.add(node.name)
+        old_func = self.current_function
+        self.current_function = node.name
+        self._check_function(node)
+        self.generic_visit(node)
+        self.current_function = old_func
+    
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+        self.defined_functions.add(node.name)
+        old_func = self.current_function
+        self.current_function = node.name
+        self._check_function(node)
+        self.generic_visit(node)
+        self.current_function = old_func
+    
+    def visit_ClassDef(self, node: ast.ClassDef):
+        self.defined_classes.add(node.name)
+        old_class = self.current_class
+        self.current_class = node.name
+        self.generic_visit(node)
+        self.current_class = old_class
+    
+    def visit_For(self, node: ast.For):
+        self.loop_depth += 1
+        self.in_loop = True
+        self._check_loop(node)
+        self.generic_visit(node)
+        self.loop_depth -= 1
+        if self.loop_depth == 0:
+            self.in_loop = False
+    
+    def visit_While(self, node: ast.While):
+        self.loop_depth += 1
+        self.in_loop = True
+        self.generic_visit(node)
+        self.loop_depth -= 1
+        if self.loop_depth == 0:
+            self.in_loop = False
+    
+    def visit_Call(self, node: ast.Call):
+        # Track function calls
+        if isinstance(node.func, ast.Name):
+            self.function_calls[node.func.id] += 1
+        
+        # Check for inefficient patterns
+        self._check_call(node)
+        self.generic_visit(node)
+    
+    def visit_ListComp(self, node: ast.ListComp):
+        self._check_comprehension(node, 'list')
+        self.generic_visit(node)
+    
+    def visit_GeneratorExp(self, node: ast.GeneratorExp):
+        self._check_comprehension(node, 'generator')
+        self.generic_visit(node)
+    
+    def _check_function(self, node):
+        # 1. Function too long
+        length = node.end_lineno - node.lineno + 1
+        if length > 50:
+            self._add_issue(
+                line=node.lineno,
+                type="function_too_long",
+                severity="medium",
+                message=f"Function '{node.name}' has {length} lines (suggest max 50)",
+                suggestion="Break it into smaller helper functions",
+                snippet=self._get_snippet(node.lineno, node.end_lineno)
+            )
+        
+        # 2. Too many parameters
+        param_count = len(node.args.args)
+        if param_count > 5:
+            self._add_issue(
+                line=node.lineno,
+                type="too_many_parameters",
+                severity="low",
+                message=f"Function '{node.name}' has {param_count} parameters (suggest max 5)",
+                suggestion="Use a config object or dataclass",
+                snippet=self._get_snippet(node.lineno, node.lineno)
+            )
+        
+        # 3. High complexity
+        complexity = self._calculate_complexity(node)
+        if complexity > 15:
+            self._add_issue(
+                line=node.lineno,
+                type="high_complexity",
+                severity="medium",
+                message=f"Function '{node.name}' has complexity {complexity} (suggest max 15)",
+                suggestion="Simplify with early returns or split into smaller functions",
+                snippet=self._get_snippet(node.lineno, node.lineno)
+            )
+        
+        # 4. Missing docstring
+        if not ast.get_docstring(node):
+            self._add_issue(
+                line=node.lineno,
+                type="missing_docstring",
+                severity="low",
+                message=f"Function '{node.name}' is missing a docstring",
+                suggestion="Add a docstring explaining what it does",
+                snippet=self._get_snippet(node.lineno, node.lineno + 3)
+            )
+        
+        # 5. Import inside function
+        for child in ast.walk(node):
+            if isinstance(child, (ast.Import, ast.ImportFrom)):
+                self._add_issue(
+                    line=child.lineno,
+                    type="import_in_function",
+                    severity="medium",
+                    message=f"Import inside function '{node.name}' (imports should be at top)",
+                    suggestion="Move import to the top of the file",
+                    snippet=self._get_snippet(child.lineno, child.lineno)
+                )
+    
+    def _check_loop(self, node: ast.For):
+        # 1. Empty loop
+        if not node.body or (len(node.body) == 1 and isinstance(node.body[0], ast.Pass)):
+            self._add_issue(
+                line=node.lineno,
+                type="empty_loop",
+                severity="medium",
+                message="Empty loop body - does nothing",
+                suggestion="Remove or implement the loop",
+                snippet=self._get_snippet(node.lineno, node.lineno)
+            )
+        
+        # 2. Nested loops (O(n²) risk)
+        has_nested = False
+        for child in ast.walk(node):
+            if isinstance(child, (ast.For, ast.While)) and child != node:
+                has_nested = True
+                break
+        
+        if has_nested and self.loop_depth > 2:
+            self._add_issue(
+                line=node.lineno,
+                type="nested_loops",
+                severity="high",
+                message=f"Nested loops detected (depth {self.loop_depth}) - potential O(n²) performance issue",
+                suggestion="Consider using dictionaries, sets, or algorithms with better complexity",
+                snippet=self._get_snippet(node.lineno, node.lineno + 2)
+            )
+    
+    def _check_call(self, node: ast.Call):
+        # 1. Repeated function call in loop (inefficient)
+        if self.in_loop:
+            func_name = None
+            if isinstance(node.func, ast.Name):
+                func_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                func_name = node.func.attr
+            
+            if func_name:
+                # Check if this call result could be cached
+                if self._is_pure_function(func_name):
+                    self._add_issue(
+                        line=node.lineno,
+                        type="repeated_call_in_loop",
+                        severity="medium",
+                        message=f"Function '{func_name}' called inside loop (could be cached)",
+                        suggestion="Move call outside loop or cache the result",
+                        snippet=self._get_snippet(node.lineno, node.lineno)
+                    )
+    
+    def _check_comprehension(self, node, kind: str):
+        # Check for list comprehension where generator would be better
+        if kind == 'list' and self._should_be_generator(node):
+            self._add_issue(
+                line=node.lineno,
+                type="use_generator",
+                severity="low",
+                message="List comprehension used for iteration - generator would use less memory",
+                suggestion="Use (expression for item in iterable) instead of [expression for item in iterable]",
+                snippet=self._get_snippet(node.lineno, node.lineno + 1)
+            )
+    
+    def _should_be_generator(self, node: ast.ListComp) -> bool:
+        """Check if list comprehension could be a generator"""
+        # If it's wrapped in a call, it might be fine
+        parent = getattr(node, 'parent', None)
+        if parent and isinstance(parent, ast.Call):
+            return False
+        return True
+    
+    def _is_pure_function(self, func_name: str) -> bool:
+        """Check if a function is likely pure (can be cached)"""
+        pure_funcs = {'len', 'sum', 'min', 'max', 'sorted', 'reversed', 'abs', 'round'}
+        return func_name in pure_funcs or func_name.startswith('is_')
+    
+    def _calculate_complexity(self, node) -> int:
+        complexity = 1
+        for child in ast.walk(node):
+            if isinstance(child, (ast.If, ast.While, ast.For, ast.AsyncFor)):
+                complexity += 1
+            elif isinstance(child, (ast.And, ast.Or)):
+                complexity += 1
+            elif isinstance(child, ast.ExceptHandler):
+                complexity += 1
+        return complexity
+    
+    def _add_issue(self, line: int, type: str, severity: str, message: str, suggestion: str, snippet: str = ""):
+        self.issues.append(Issue(
+            file=self.filename,
+            line=line,
+            type=type,
+            severity=severity,
+            message=message,
+            suggestion=suggestion,
+            code_snippet=snippet
+        ))
+    
+    def _get_snippet(self, start: int, end: int) -> str:
+        """Get code snippet from lines"""
+        if start < 1:
+            start = 1
+        if end > len(self.lines):
+            end = len(self.lines)
+        return '\n'.join(self.lines[start-1:end]).strip()
+
+# ============================================
+# SCANNER WRAPPER
+# ============================================
+
+def scan_file(filepath: str) -> List[Issue]:
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            code = f.read()
+        tree = ast.parse(code, filename=filepath)
+        scanner = CodeScanner(filepath, code)
+        scanner.visit(tree)
+        return scanner.issues
+    except Exception as e:
+        return [Issue(
+            file=filepath,
+            line=0,
+            type="parse_error",
+            severity="low",
+            message=f"Could not parse file: {e}",
+            suggestion="Check for syntax errors"
+        )]
+
+def scan_directory(root_path: str) -> List[Issue]:
+    root = Path(root_path).resolve()
+    all_issues = []
+    skip_patterns = ['__pycache__', 'venv', '.venv', 'env', '.env', 'site-packages']
+    
+    for py_file in root.rglob("*.py"):
+        parts = py_file.parts
+        should_skip = False
+        for pattern in skip_patterns:
+            if pattern in parts:
+                should_skip = True
+                break
+        if should_skip:
+            continue
+        
+        issues = scan_file(str(py_file))
+        all_issues.extend(issues)
+    
+    return all_issues
+
+# ============================================
+# FORMATTERS
+# ============================================
+
+def to_console(issues: List[Issue], root_path: str) -> str:
+    if not issues:
+        return "✅ No issues found"
+    
+    by_severity = defaultdict(list)
+    for issue in issues:
+        by_severity[issue.severity].append(issue)
+    
+    lines = []
+    lines.append("=" * 70)
+    lines.append("📊 Code Quality Report")
+    lines.append("=" * 70)
+    
+    # Summary
+    total = len(issues)
+    high = len(by_severity['high'])
+    medium = len(by_severity['medium'])
+    low = len(by_severity['low'])
+    lines.append(f"\n📊 Summary:")
+    lines.append(f"   Total issues: {total}")
+    lines.append(f"   🔴 High: {high}")
+    lines.append(f"   🟡 Medium: {medium}")
+    lines.append(f"   🟢 Low: {low}")
+    
+    # Issues by severity
+    for severity in ['high', 'medium', 'low']:
+        issues_list = by_severity.get(severity, [])
+        if not issues_list:
+            continue
+        icon = '🔴' if severity == 'high' else '🟡' if severity == 'medium' else '🟢'
+        lines.append(f"\n{icon} {severity.upper()} ({len(issues_list)} issues):")
+        
+        for issue in issues_list[:10]:
+            lines.append(f"   {issue.file}:{issue.line} [{issue.type}]")
+            lines.append(f"      {issue.message}")
+            lines.append(f"      💡 {issue.suggestion}")
+            if issue.code_snippet:
+                lines.append(f"      📝 {issue.code_snippet[:80]}...")
+        
+        if len(issues_list) > 10:
+            lines.append(f"   ... and {len(issues_list) - 10} more")
+    
+    return '\n'.join(lines)
+
+def to_json(issues: List[Issue], root_path: str) -> str:
+    report = {
+        'root': root_path,
+        'generated_at': datetime.now().isoformat(),
+        'total_issues': len(issues),
+        'severity_counts': {
+            'high': len([i for i in issues if i.severity == 'high']),
+            'medium': len([i for i in issues if i.severity == 'medium']),
+            'low': len([i for i in issues if i.severity == 'low'])
+        },
+        'issues': [asdict(i) for i in issues]
+    }
+    return json.dumps(report, indent=2)
+
+# ============================================
+# MAIN
+# ============================================
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    
+    root_path = sys.argv[1]
+    format_type = 'console'
+    output_file = None
+    
+    for i, arg in enumerate(sys.argv):
+        if arg == '--format' and i + 1 < len(sys.argv):
+            format_type = sys.argv[i + 1]
+        if arg == '--output' and i + 1 < len(sys.argv):
+            output_file = sys.argv[i + 1]
+    
+    root = Path(root_path).resolve()
+    print(f"📁 Scanning: {root}")
+    
+    issues = scan_directory(str(root))
+    
+    if format_type == 'json':
+        output = to_json(issues, str(root))
+    else:
+        output = to_console(issues, str(root))
+    
+    if output_file:
+        Path(output_file).write_text(output, encoding='utf-8')
+        print(f"✅ Report saved to: {output_file}")
+    else:
+        print(output)
+
+if __name__ == "__main__":
+    main()
